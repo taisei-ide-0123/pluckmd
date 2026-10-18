@@ -101,6 +101,36 @@ describe("discoverArticlesFromSitemap", () => {
     expect(result.links.map((link) => link.url)).toEqual(["https://example.com/blog/a"]);
   });
 
+  it("does not follow sitemaps on other hosts", async () => {
+    const requested: string[] = [];
+    const documents: Record<string, string> = {
+      "https://example.com/robots.txt": "Sitemap: http://127.0.0.1/internal.xml\nSitemap: https://www.example.com/index.xml",
+      "https://www.example.com/index.xml":
+        "<sitemapindex><sitemap><loc>http://169.254.169.254/latest</loc></sitemap>" +
+        "<sitemap><loc>https://example.com/posts.xml</loc></sitemap></sitemapindex>",
+      "https://example.com/posts.xml": urlset([["https://example.com/blog/a"]]),
+    };
+    const fetcher: SitemapFetcher = async (url) => {
+      requested.push(url);
+      return fakeFetcher(documents)(url);
+    };
+
+    const result = await discoverArticlesFromSitemap("https://example.com/blog", fetcher, { limit: 10 });
+    expect(result.links.map((link) => link.url)).toEqual(["https://example.com/blog/a"]);
+    expect(requested.some((url) => url.includes("127.0.0.1") || url.includes("169.254"))).toBe(false);
+  });
+
+  it("rejects gzip payloads that expand beyond the sitemap size cap", async () => {
+    const bomb = gzipSync(Buffer.alloc(51 * 1024 * 1024, 0x20));
+    const fetcher = fakeFetcher({ "https://example.com/s.xml.gz": bomb });
+
+    const result = await discoverArticlesFromSitemap("https://example.com/blog", fetcher, {
+      limit: 10,
+      sitemapUrl: "https://example.com/s.xml.gz",
+    });
+    expect(result.totalEntries).toBe(0);
+  });
+
   it("reports undated entries excluded by --since", async () => {
     const fetcher = fakeFetcher({
       "https://example.com/robots.txt": "Sitemap: https://example.com/s.xml",

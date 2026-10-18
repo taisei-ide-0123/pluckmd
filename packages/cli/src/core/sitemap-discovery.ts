@@ -40,6 +40,8 @@ export interface SitemapDiscoveryResult {
 const WELL_KNOWN_SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml"];
 const DEFAULT_MAX_SITEMAPS = 50;
 const GZIP_MAGIC = [0x1f, 0x8b];
+// sitemaps.org caps a sitemap at 50 MB uncompressed; also bounds gzip bombs.
+const MAX_SITEMAP_BYTES = 50 * 1024 * 1024;
 
 export async function discoverArticlesFromSitemap(
   scopeUrl: string,
@@ -56,10 +58,16 @@ export async function discoverArticlesFromSitemap(
     );
   }
 
+  // robots.txt and sitemap indexes are site-controlled, so only follow
+  // sitemaps on the scope site (or an explicitly passed sitemap's host) to
+  // keep a hostile site from steering requests at other hosts.
+  const allowedHosts = new Set([siteKey(new URL(scopeUrl).hostname)]);
+  if (options.sitemapUrl) allowedHosts.add(siteKey(new URL(options.sitemapUrl).hostname));
   const { entries, fetchedSitemaps } = await collectSitemapEntries(
-    rootSitemaps,
+    rootSitemaps.filter((url) => isFollowableSitemap(url, allowedHosts)),
     fetcher,
     options.maxSitemaps ?? DEFAULT_MAX_SITEMAPS,
+    allowedHosts,
   );
   const scoped = selectArticleEntries(entries, scopeUrl);
   const inScope = options.since ? filterModifiedSince(scoped, options.since) : scoped;
@@ -98,6 +106,7 @@ async function collectSitemapEntries(
   rootSitemaps: readonly string[],
   fetcher: SitemapFetcher,
   maxSitemaps: number,
+  allowedHosts: ReadonlySet<string>,
 ): Promise<{ entries: SitemapEntry[]; fetchedSitemaps: string[] }> {
   const queue = [...rootSitemaps];
   const visited = new Set<string>();
@@ -111,7 +120,7 @@ async function collectSitemapEntries(
     const xml = await fetchText(sitemapUrl, fetcher);
     if (!xml) continue;
     const parsed = parseSitemapXml(xml);
-    queue.push(...parsed.childSitemaps);
+    queue.push(...parsed.childSitemaps.filter((url) => isFollowableSitemap(url, allowedHosts)));
     entries.push(...parsed.entries);
   }
   return { entries, fetchedSitemaps: [...visited] };
@@ -226,6 +235,19 @@ function dedupeByUrl(entries: readonly SitemapEntry[]): SitemapEntry[] {
   return [...byUrl.values()];
 }
 
+function isFollowableSitemap(url: string, allowedHosts: ReadonlySet<string>): boolean {
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "https:" || parsed.protocol === "http:") && allowedHosts.has(siteKey(parsed.hostname));
+  } catch {
+    return false;
+  }
+}
+
+function siteKey(hostname: string): string {
+  return stripWww(hostname.toLowerCase());
+}
+
 function sameSite(url: string, scope: URL): boolean {
   try {
     return stripWww(new URL(url).hostname) === stripWww(scope.hostname);
@@ -269,7 +291,8 @@ async function fetchText(url: string, fetcher: SitemapFetcher): Promise<string |
   try {
     const { status, body } = await fetcher(url);
     if (status < 200 || status >= 300) return null;
-    const bytes = GZIP_MAGIC.every((byte, index) => body[index] === byte) ? gunzipSync(body) : body;
+    const bytes = GZIP_MAGIC.every((byte, index) => body[index] === byte) ? gunzipSync(body, { maxOutputLength: MAX_SITEMAP_BYTES }) : body;
+    if (bytes.length > MAX_SITEMAP_BYTES) return null;
     return new TextDecoder().decode(bytes);
   } catch {
     return null;
