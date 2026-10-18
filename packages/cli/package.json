@@ -1,6 +1,6 @@
 {
   "name": "pluckmd",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Bulk download article listings as Markdown with generic AdapterSpecs and optional browser-session support.",
   "license": "MIT",
   "type": "module",
@@ -32,7 +32,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsup",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "prepack": "cp ../../README.md README.md"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
