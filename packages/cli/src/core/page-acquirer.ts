@@ -7,6 +7,8 @@ import type {
 } from "@pluckmd/shared";
 import { getProfileDir } from "@pluckmd/shared";
 import { Agent, fetch as undiciFetch } from "undici";
+import { detectBotChallenge } from "./bot-challenge.js";
+import { RealBrowserFetcher, type RealBrowserPage } from "./real-browser.js";
 
 // Node's global fetch caps response headers at ~16 KB and throws
 // UND_ERR_HEADERS_OVERFLOW on sites that emit large Set-Cookie/consent headers
@@ -43,10 +45,24 @@ interface BrowserPage {
   close(): Promise<void>;
 }
 
+/** The subset of RealBrowserFetcher the acquirer uses; injectable for tests. */
+export interface BotChallengeBrowser {
+  fetchPage(url: string): Promise<RealBrowserPage>;
+  fetchBytes(url: string, maxBytes: number): Promise<RawFetchResult>;
+  close(): Promise<void>;
+}
+
+export interface RawFetchResult {
+  readonly status: number;
+  readonly body: Uint8Array;
+  readonly finalUrl: string;
+}
+
 export interface RenderingPageAcquirerOptions {
   render?: RenderMode;
   timeoutMs?: number;
   profileDir?: string;
+  realBrowser?: BotChallengeBrowser;
 }
 
 interface StaticFetchResult {
@@ -60,38 +76,96 @@ export class RenderingPageAcquirer implements PageAcquirer {
   private readonly timeoutMs: number;
   private readonly profileDir: string;
   private browserContext: BrowserContext | null = null;
+  // Hosts whose bot protection rejects headless Chromium (e.g. HTTP/2 resets).
+  // Remembered so a bulk download does not pay a failed render per article.
+  private readonly renderRejectingHosts = new Set<string>();
+  // Hosts that served a bot challenge to static fetch; later requests go
+  // straight to real Chrome instead of re-triggering the challenge.
+  private readonly challengedHosts = new Set<string>();
+  private readonly realBrowser: BotChallengeBrowser;
 
   constructor(options: RenderingPageAcquirerOptions = {}) {
     this.render = options.render ?? "auto";
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.profileDir = options.profileDir ?? getProfileDir();
+    // Separate profile: Chrome and the bundled Chromium cannot share one, and
+    // both contexts may be open at once.
+    this.realBrowser =
+      options.realBrowser ?? new RealBrowserFetcher(`${this.profileDir}-chrome`, this.timeoutMs);
   }
 
   async acquire(url: string): Promise<PageAnalysisInput> {
+    const host = new URL(url).host;
+    if (this.challengedHosts.has(host)) return this.acquireThroughRealBrowser(url);
     if (this.render === "always") {
       return this.acquireRendered(url);
     }
 
     const staticPage = await this.acquireStatic(url);
+    if (detectBotChallenge(staticPage)) {
+      this.challengedHosts.add(host);
+      return this.acquireThroughRealBrowser(url);
+    }
+    const staticResult: PageAnalysisInput = {
+      requestedUrl: url,
+      finalUrl: staticPage.finalUrl,
+      status: staticPage.status,
+      html: staticPage.html,
+      source: "static",
+      renderMode: this.render,
+    };
     if (this.render === "never" || !shouldRetryWithRendering(staticPage.html)) {
-      return {
-        requestedUrl: url,
-        finalUrl: staticPage.finalUrl,
-        status: staticPage.status,
-        html: staticPage.html,
-        source: "static",
-        renderMode: this.render,
-      };
+      return staticResult;
     }
 
-    return this.acquireRendered(url);
+    if (this.renderRejectingHosts.has(host)) return staticResult;
+    try {
+      return await this.acquireRendered(url);
+    } catch (renderError) {
+      if (!isUsableStaticPage(staticPage) || isPlaywrightMissing(renderError)) throw renderError;
+      // Server-rendered frameworks (Next.js etc.) trip shouldRetryWithRendering
+      // even when the static HTML is complete; keep it rather than abort.
+      this.renderRejectingHosts.add(host);
+      console.warn(
+        `⚠️  Rendering failed for ${host} (${firstLine(renderError)}); using static HTML instead.`,
+      );
+      return staticResult;
+    }
+  }
+
+  /**
+   * Raw-bytes fetch for sitemaps and robots.txt, escalating to real Chrome
+   * when the static response is a bot challenge.
+   */
+  async fetchBytes(url: string, maxBytes: number): Promise<RawFetchResult> {
+    const host = new URL(url).host;
+    if (!this.challengedHosts.has(host)) {
+      const response = await fetchStaticBytes(url, this.timeoutMs, maxBytes);
+      const html = new TextDecoder().decode(response.body.subarray(0, 64 * 1024));
+      if (!detectBotChallenge({ status: response.status, html })) return response;
+      this.challengedHosts.add(host);
+    }
+    return this.realBrowser.fetchBytes(url, maxBytes);
   }
 
   async close(): Promise<void> {
+    await this.realBrowser.close();
     if (this.browserContext) {
       await this.browserContext.close();
       this.browserContext = null;
     }
+  }
+
+  private async acquireThroughRealBrowser(url: string): Promise<PageAnalysisInput> {
+    const page = await this.realBrowser.fetchPage(url);
+    return {
+      requestedUrl: url,
+      finalUrl: page.finalUrl,
+      status: page.status,
+      html: page.html,
+      source: "rendered",
+      renderMode: this.render,
+    };
   }
 
   private async acquireStatic(url: string): Promise<StaticFetchResult> {
@@ -298,6 +372,50 @@ class PlaywrightDomEvaluator implements DomEvaluator {
   async wait(milliseconds: number): Promise<void> {
     await this.page.waitForTimeout(milliseconds);
   }
+}
+
+/**
+ * Reads at most `maxBytes` of the decoded body; larger responses are aborted
+ * mid-stream so Content-Encoding cannot inflate them past the cap in memory.
+ */
+async function fetchStaticBytes(url: string, timeoutMs: number, maxBytes: number): Promise<RawFetchResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await undiciFetch(url, {
+      dispatcher: staticFetchAgent,
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "User-Agent": DEFAULT_USER_AGENT, Accept: "application/xml,text/xml,text/plain,*/*" },
+    });
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for await (const chunk of response.body ?? []) {
+      received += chunk.byteLength;
+      if (received > maxBytes) {
+        controller.abort();
+        throw new Error(`Response from ${url} exceeds ${maxBytes} bytes`);
+      }
+      chunks.push(chunk);
+    }
+    return { status: response.status, body: Buffer.concat(chunks), finalUrl: response.url || url };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isUsableStaticPage(page: StaticFetchResult): boolean {
+  return page.status >= 200 && page.status < 300 && page.html.length > 0;
+}
+
+function isPlaywrightMissing(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("Playwright is not installed") || message.includes("Executable doesn't exist");
+}
+
+function firstLine(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.split("\n")[0];
 }
 
 export function shouldRetryWithRendering(html: string): boolean {

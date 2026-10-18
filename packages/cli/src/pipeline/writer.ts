@@ -1,4 +1,4 @@
-import { mkdir, writeFile, access } from "node:fs/promises";
+import { mkdir, writeFile, access, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ArticleMetadata } from "@pluckmd/shared";
 
@@ -53,4 +53,31 @@ export async function writeArticle(
 
   await writeFile(filepath, content, "utf-8");
   return filepath;
+}
+
+/**
+ * Collects `source:` URLs from Markdown files already in the output directory,
+ * so an interrupted bulk download can resume without re-fetching or writing
+ * `-2.md` duplicates.
+ */
+export async function readDownloadedSources(outputDir: string): Promise<Set<string>> {
+  let filenames: string[];
+  try {
+    filenames = await readdir(outputDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+    throw error;
+  }
+
+  const sources = await Promise.all(
+    filenames
+      .filter((filename) => filename.endsWith(".md"))
+      .map(async (filename) => readFrontmatterSource(await readFile(join(outputDir, filename), "utf-8"))),
+  );
+  return new Set(sources.filter((source): source is string => Boolean(source)));
+}
+
+function readFrontmatterSource(content: string): string | undefined {
+  const frontmatter = content.match(/^---\n([\s\S]*?)\n---/);
+  return frontmatter?.[1].match(/^source:\s*(\S+)\s*$/m)?.[1];
 }
