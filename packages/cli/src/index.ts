@@ -32,6 +32,8 @@ program
   .option("--render <mode>", "Generic extraction render mode: auto, never, always", parseRenderMode, "auto")
   .option("--refresh-adapter", "Bypass cached generic adapter specs")
   .option("--active-tab", "Use the current Chrome tab through the pluckmd extension as the listing page")
+  .option("--sitemap [url]", "Discover articles from the site's sitemap (scoped to the URL path) instead of the listing page")
+  .option("--since <date>", "With --sitemap, only articles modified on or after this date (YYYY-MM-DD)", parseDate)
   .action(async (url: string, opts: DownloadCliOptions) => {
     await downloadCommand(url, {
       output: opts.output,
@@ -43,6 +45,8 @@ program
       render: opts.render,
       refreshAdapter: Boolean(opts.refreshAdapter),
       activeTab: Boolean(opts.activeTab),
+      sitemap: opts.sitemap,
+      since: opts.since,
     });
   });
 
@@ -115,6 +119,8 @@ interface DownloadCliOptions {
   render: "auto" | "never" | "always";
   refreshAdapter?: boolean;
   activeTab?: boolean;
+  sitemap?: boolean | string;
+  since?: Date;
 }
 
 interface InspectCliOptions {
@@ -146,4 +152,12 @@ function parseNonNegativeInteger(value: string): number {
 function parseRenderMode(value: string): "auto" | "never" | "always" {
   if (value === "auto" || value === "never" || value === "always") return value;
   throw new InvalidArgumentError("render mode must be one of: auto, never, always");
+}
+
+function parseDate(value: string): Date {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new InvalidArgumentError("must be a date such as 2025-01-01");
+  }
+  return parsed;
 }

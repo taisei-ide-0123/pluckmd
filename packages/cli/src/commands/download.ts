@@ -16,10 +16,12 @@ import {
 import { ExtensionFetcher } from "../core/extension-fetcher.js";
 import { resolveGenericAdapterSpec } from "../core/generic-resolver.js";
 import { GenericLinkCollector } from "../core/link-collector.js";
+import { assertArticlePageOk, assertNotBotChallenge } from "../core/bot-challenge.js";
 import { RenderingPageAcquirer } from "../core/page-acquirer.js";
 import { ReadabilityArticleExtractor } from "../core/heuristic-analyzer.js";
+import { discoverArticlesFromSitemap, type SitemapFetcher } from "../core/sitemap-discovery.js";
 import { convertHtmlToMarkdown } from "../pipeline/converter.js";
-import { writeArticle } from "../pipeline/writer.js";
+import { readDownloadedSources, writeArticle } from "../pipeline/writer.js";
 import pLimit from "p-limit";
 
 export interface DownloadCommandOptions {
@@ -32,12 +34,18 @@ export interface DownloadCommandOptions {
   render?: RenderMode;
   refreshAdapter?: boolean;
   activeTab?: boolean;
+  /** true = discover via robots.txt/well-known sitemap; string = explicit sitemap URL. */
+  sitemap?: boolean | string;
+  since?: Date;
 }
 
 type ArticleAcquirer = (url: string) => Promise<PageAnalysisInput>;
 
 interface DownloadSource {
   readonly label: string;
+  readonly url?: string;
+  /** Raw fetch for sitemaps; absent when the source cannot fetch arbitrary files. */
+  readonly fetchBytes?: SitemapFetcher;
   readonly listingDescription?: string;
   acquireListing(): Promise<PageAnalysisInput>;
   acquireArticle: ArticleAcquirer;
@@ -79,11 +87,25 @@ function createDownloadSource(
   const acquirer = new RenderingPageAcquirer({ render: options.render ?? "auto" });
   return {
     label: "generic",
+    url,
+    fetchBytes: (fileUrl) => acquirer.fetchBytes(fileUrl),
     acquireListing: () => acquirer.acquire(url),
     acquireArticle: (articleUrl) => acquirer.acquire(articleUrl),
     close: () => acquirer.close(),
   };
 }
+
+const ARTICLE_ONLY_SPEC: AdapterSpec = {
+  listing: { articleLinkSelector: "a[href]", articleLinkHrefPattern: ".*" },
+  article: { method: "readability" },
+  pagination: { method: "none" },
+  evidence: "Article URLs supplied directly (sitemap or single-article fallback)",
+};
+
+type CollectedArticles =
+  | { readonly kind: "articles"; readonly links: readonly ArticleRef[]; readonly spec: AdapterSpec }
+  // The URL was not a listing; download the already-fetched page itself.
+  | { readonly kind: "single-article"; readonly page: PageAnalysisInput };
 
 async function runGenericDownload(
   source: DownloadSource,
@@ -91,10 +113,41 @@ async function runGenericDownload(
   reporter: DownloadReporter,
 ): Promise<DownloadResult> {
   const extractor = new ReadabilityArticleExtractor();
+  reporter.sourceSelected(options.sitemap ? `${source.label} (sitemap)` : source.label);
+
+  const collected = options.sitemap
+    ? await collectFromSitemap(source, options, reporter)
+    : await collectFromListingOrSitemap(source, options, reporter);
+  if (collected.kind === "single-article") {
+    return downloadSingleArticle(collected.page, options, extractor, reporter);
+  }
+
+  const pending = await skipAlreadyDownloaded(collected.links, options.output, reporter);
   const concurrencyLimit = pLimit(options.concurrency);
-  reporter.sourceSelected(source.label);
+  const tasks = pending.map((articleRef, index) =>
+    concurrencyLimit(() => downloadArticleSafely({
+      articleRef,
+      index,
+      options,
+      source,
+      extractor,
+      adapterSpec: collected.spec,
+    })),
+  );
+
+  const outcomes = await Promise.all(tasks);
+  reportArticleOutcomes(outcomes, reporter);
+  return summarizeDownload(outcomes);
+}
+
+async function collectFromListing(
+  source: DownloadSource,
+  options: DownloadCommandOptions,
+  reporter: DownloadReporter,
+): Promise<CollectedArticles> {
   const listing = await source.acquireListing();
   reporter.listingAcquired(source.listingDescription, listing);
+  assertNotBotChallenge(listing);
 
   let resolved: Awaited<ReturnType<typeof resolveGenericAdapterSpec>>;
   try {
@@ -106,34 +159,85 @@ async function runGenericDownload(
     // The URL did not look like a listing (no repeated article-link clusters).
     // Fall back to treating the fetched page itself as a single article.
     const message = resolveError instanceof Error ? resolveError.message : String(resolveError);
-    reporter.singleArticleFallback?.(message);
-    return downloadSingleArticle(listing, options, extractor, reporter);
+    reporter.listingUnresolved?.(message);
+    return { kind: "single-article", page: listing };
   }
   reporter.adapterResolved(resolved);
 
   const collected = await new GenericLinkCollector({
     maxElapsedMs: options.paginationTimeoutMs,
-  }).collectLinks(
-    listing,
-    resolved.spec,
-    options.limit,
-  );
+  }).collectLinks(listing, resolved.spec, options.limit);
   reporter.articlesCollected(collected.links.length, collected.stoppedBecause);
+  return { kind: "articles", links: collected.links, spec: resolved.spec };
+}
 
-  const tasks = collected.links.map((articleRef, index) =>
-    concurrencyLimit(() => downloadArticleSafely({
-      articleRef,
-      index,
-      options,
-      source,
-      extractor,
-      adapterSpec: resolved.spec,
-    })),
-  );
+// Below this many links, a listing has likely shown only its first JS-rendered
+// batch ("Load more" not followed), so the sitemap is worth checking. Kept low
+// so ordinary blogs whose listings paginate fine never pay for a sitemap read.
+const SPARSE_LISTING_THRESHOLD = 20;
 
-  const outcomes = await Promise.all(tasks);
-  reportArticleOutcomes(outcomes, reporter);
-  return summarizeDownload(outcomes);
+/**
+ * Large corporate listings often defeat link heuristics or expose only a few
+ * links, while their sitemap lists every article under the URL. Use the
+ * sitemap when the listing is unresolved or sparse and the sitemap has more.
+ */
+async function collectFromListingOrSitemap(
+  source: DownloadSource,
+  options: DownloadCommandOptions,
+  reporter: DownloadReporter,
+): Promise<CollectedArticles> {
+  const fromListing = await collectFromListing(source, options, reporter);
+  const listingCount = fromListing.kind === "articles" ? fromListing.links.length : 0;
+  if (!shouldTrySitemap(source, listingCount, options.limit)) return fromListing;
+
+  reporter.sitemapFallback?.(listingCount);
+  try {
+    const fromSitemap = await collectFromSitemap(source, options, reporter);
+    if (fromSitemap.kind === "articles" && fromSitemap.links.length > listingCount) return fromSitemap;
+    reporter.sitemapNotBetter?.();
+  } catch (sitemapError) {
+    const message = sitemapError instanceof Error ? sitemapError.message : String(sitemapError);
+    reporter.sitemapUnavailable?.(message);
+  }
+  return fromListing;
+}
+
+function shouldTrySitemap(source: DownloadSource, listingCount: number, limit: number): boolean {
+  if (!source.url || !source.fetchBytes) return false;
+  // A site-root scope would pull every page on the site, not just articles.
+  if (new URL(source.url).pathname.replace(/\/+$/, "") === "") return false;
+  return listingCount < Math.min(limit, SPARSE_LISTING_THRESHOLD);
+}
+
+async function collectFromSitemap(
+  source: DownloadSource,
+  options: DownloadCommandOptions,
+  reporter: DownloadReporter,
+): Promise<CollectedArticles> {
+  if (!source.url || !source.fetchBytes) {
+    throw new Error("--sitemap requires a URL (it cannot be combined with --active-tab)");
+  }
+  const discovered = await discoverArticlesFromSitemap(source.url, source.fetchBytes, {
+    sitemapUrl: typeof options.sitemap === "string" ? options.sitemap : undefined,
+    since: options.since,
+    limit: options.limit,
+  });
+  reporter.sitemapDiscovered?.(discovered);
+  const stoppedBecause = discovered.inScopeEntries > discovered.links.length ? "limit" : "complete";
+  reporter.articlesCollected(discovered.links.length, stoppedBecause);
+  return { kind: "articles", links: discovered.links, spec: ARTICLE_ONLY_SPEC };
+}
+
+async function skipAlreadyDownloaded(
+  links: readonly ArticleRef[],
+  outputDir: string,
+  reporter: DownloadReporter,
+): Promise<ArticleRef[]> {
+  const downloaded = await readDownloadedSources(outputDir);
+  const pending = links.filter((link) => !downloaded.has(link.url));
+  const skipped = links.length - pending.length;
+  if (skipped > 0) reporter.alreadyDownloadedSkipped?.(skipped);
+  return pending;
 }
 
 async function downloadSingleArticle(
@@ -143,12 +247,7 @@ async function downloadSingleArticle(
   reporter: DownloadReporter,
 ): Promise<DownloadResult> {
   const articleRef: ArticleRef = { url: page.finalUrl };
-  const singleArticleSpec: AdapterSpec = {
-    listing: { articleLinkSelector: "a[href]", articleLinkHrefPattern: ".*" },
-    article: { method: "readability" },
-    pagination: { method: "none" },
-    evidence: "Single-article fallback: URL was not a resolvable listing page",
-  };
+  reporter.singleArticleFallback?.();
 
   reporter.articlesCollected(1, "complete");
   try {
@@ -156,7 +255,7 @@ async function downloadSingleArticle(
       url: articleRef.url,
       finalUrl: page.finalUrl,
       html: page.html,
-    }, singleArticleSpec);
+    }, ARTICLE_ONLY_SPEC);
     const { markdown } = convertHtmlToMarkdown(parsed.bodyHtml, articleRef.url);
     await writeArticle(options.output, parsed.metadata, markdown);
     const outcome: ArticleDownloadOutcome = { status: "saved", articleRef };
@@ -236,6 +335,7 @@ async function downloadOneArticle(
   await applyPerArticleDelay(index, options.delay);
 
   const page = await acquireArticle(articleRef.url);
+  assertArticlePageOk(page);
   const parsed = await extractor.extractArticle({
     url: articleRef.url,
     finalUrl: page.finalUrl,

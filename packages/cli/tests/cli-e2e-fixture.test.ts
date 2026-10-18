@@ -60,6 +60,56 @@ describe("pluckmd CLI fixture E2E", () => {
     expect(fifthArticle).toContain("This fixture article has deterministic body text number 5.");
   });
 
+  it("switches to the sitemap when the listing exposes only a few articles", async () => {
+    const server = await startFixtureServer();
+    const outputDir = await makeTempDir("pluckmd-output-");
+    const homeDir = await makeTempDir("pluckmd-home-");
+
+    const result = await runPluckmd([
+      "download",
+      `${server.origin}/news`,
+      "--no-llm",
+      "--render",
+      "never",
+      "--refresh-adapter",
+      "--delay",
+      "0",
+      "--limit",
+      "50",
+      "-o",
+      outputDir,
+    ], homeDir);
+
+    expect(result.stdout).toContain("Listing returned only 3 articles");
+    expect(result.stdout).toContain("Articles under this URL: 8");
+    expect(result.stdout).toContain("Result: 8 saved, 0 failed");
+    expect(await readdir(outputDir)).toHaveLength(8);
+  });
+
+  it("keeps listing results when the listing already satisfies the limit", async () => {
+    const server = await startFixtureServer();
+    const outputDir = await makeTempDir("pluckmd-output-");
+    const homeDir = await makeTempDir("pluckmd-home-");
+
+    const result = await runPluckmd([
+      "download",
+      `${server.origin}/news`,
+      "--no-llm",
+      "--render",
+      "never",
+      "--refresh-adapter",
+      "--delay",
+      "0",
+      "--limit",
+      "3",
+      "-o",
+      outputDir,
+    ], homeDir);
+
+    expect(result.stdout).not.toContain("sitemap");
+    expect(result.stdout).toContain("Result: 3 saved, 0 failed");
+  });
+
   it("inspects a local fixture without LLM configuration", async () => {
     const server = await startFixtureServer();
     const homeDir = await makeTempDir("pluckmd-home-");
@@ -110,7 +160,24 @@ async function startFixtureServer(): Promise<FixtureServer> {
       return;
     }
 
-    const match = url.match(/^\/posts\/fixture-(\d+)$/);
+    if (url === "/news") {
+      response.end(listingPage([1, 2, 3], undefined, "/news/item-"));
+      return;
+    }
+
+    if (url === "/robots.txt") {
+      response.setHeader("Content-Type", "text/plain");
+      response.end(`User-agent: *\nSitemap: http://${request.headers.host}/sitemap.xml\n`);
+      return;
+    }
+
+    if (url === "/sitemap.xml") {
+      response.setHeader("Content-Type", "application/xml");
+      response.end(newsSitemap(`http://${request.headers.host}`, 8));
+      return;
+    }
+
+    const match = url.match(/^\/(?:posts\/fixture|news\/item)-(\d+)$/);
     if (match) {
       response.end(articlePage(Number(match[1])));
       return;
@@ -133,9 +200,9 @@ async function startFixtureServer(): Promise<FixtureServer> {
   };
 }
 
-function listingPage(ids: readonly number[], nextPath?: string): string {
+function listingPage(ids: readonly number[], nextPath?: string, articlePathPrefix = "/posts/fixture-"): string {
   const links = ids
-    .map((id) => `<li><a href="/posts/fixture-${id}">Fixture Article ${id}</a></li>`)
+    .map((id) => `<li><a href="${articlePathPrefix}${id}">Fixture Article ${id}</a></li>`)
     .join("");
   const next = nextPath ? `<a rel="next" href="${nextPath}">Older articles</a>` : "";
   return `<!doctype html>
@@ -149,6 +216,13 @@ function listingPage(ids: readonly number[], nextPath?: string): string {
         </main>
       </body>
     </html>`;
+}
+
+function newsSitemap(origin: string, count: number): string {
+  const urls = Array.from({ length: count }, (_, index) =>
+    `<url><loc>${origin}/news/item-${index + 1}</loc><lastmod>2026-05-${String(index + 1).padStart(2, "0")}</lastmod></url>`,
+  ).join("");
+  return `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}</urlset>`;
 }
 
 function articlePage(id: number): string {

@@ -92,9 +92,42 @@ Download all articles from a listing page.
 | `--render <mode>` | `auto`, `never`, `always` for generic extraction | `auto` |
 | `--refresh-adapter` | Bypass cached generic adapter specs | off |
 | `--active-tab` | Use the current Chrome tab through the pluckmd extension as the listing page | off |
+| `--sitemap [url]` | Discover articles from the site's sitemap, scoped to the URL path, newest first | off |
+| `--since <date>` | With `--sitemap`, only articles whose `<lastmod>` is on or after this date | off |
 
 The download path uses runtime-generated AdapterSpecs rather than source-code
 site adapters.
+
+Re-running `download` into the same output directory skips articles whose
+`source:` URL is already saved, so large downloads can be resumed.
+
+#### Large sites: `--sitemap`
+
+Many publisher sites only show a few articles behind a JavaScript "Load more"
+button, but list every article in their sitemap. `--sitemap` reads
+`robots.txt` → sitemap (including sitemap indexes and `.gz`), keeps URLs under
+the path you passed, and downloads the newest first:
+
+```bash
+# The 200 most recent BCG publications
+pluckmd download https://www.bcg.com/publications --sitemap --limit 200
+
+# Only articles updated since 2025
+pluckmd download https://example.com/blog --sitemap --since 2025-01-01 --limit 1000
+```
+
+Without `--sitemap`, `download` still checks the sitemap automatically when the
+listing cannot be resolved or yields fewer than `min(--limit, 20)` articles
+(typical of "Load more" listings), and uses it if it finds more. Site-root URLs
+are excluded from this fallback, since their sitemap covers every page.
+
+#### Bot-protected sites
+
+If a site answers with a bot-protection challenge (Cloudflare, Akamai, ...),
+pluckmd switches that host to your installed Google Chrome (launched off-screen
+with a separate `~/.pluckmd/chrome-profile-chrome` profile), waits for the
+challenge to clear, and fetches pages and sitemaps from there. Requires Google
+Chrome; challenge pages are never saved as articles.
 
 ### `pluckmd inspect <url>`
 
