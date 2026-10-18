@@ -13,7 +13,7 @@ const DEFAULT_PAGINATION_TIMEOUT_MS = 5 * 60 * 1000;
 program
   .name("pluckmd")
   .description("Bulk download blog articles as Markdown files")
-  .version("0.1.1");
+  .version("0.2.0");
 
 program
   .command("download [url]")

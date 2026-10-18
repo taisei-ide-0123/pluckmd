@@ -14,3 +14,4 @@ Thumbs.db
 # Local dev writes rendered articles here (default `-o ./articles` resolves to
 # packages/cli/articles from the workspace).
 /packages/cli/articles/
+packages/cli/README.md
