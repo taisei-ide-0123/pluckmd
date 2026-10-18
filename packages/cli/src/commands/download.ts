@@ -88,7 +88,7 @@ function createDownloadSource(
   return {
     label: "generic",
     url,
-    fetchBytes: (fileUrl) => acquirer.fetchBytes(fileUrl),
+    fetchBytes: (fileUrl, maxBytes) => acquirer.fetchBytes(fileUrl, maxBytes),
     acquireListing: () => acquirer.acquire(url),
     acquireArticle: (articleUrl) => acquirer.acquire(articleUrl),
     close: () => acquirer.close(),

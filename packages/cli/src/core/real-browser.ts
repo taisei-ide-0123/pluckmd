@@ -52,20 +52,37 @@ export class RealBrowserFetcher {
     }
   }
 
-  /** Fetches a raw resource (sitemap, robots.txt) from inside a cleared page. */
-  async fetchBytes(url: string): Promise<{ status: number; body: Uint8Array }> {
+  /**
+   * Fetches a raw resource (sitemap, robots.txt) from inside a cleared page,
+   * streaming so an oversize body is cancelled at `maxBytes`.
+   */
+  async fetchBytes(url: string, maxBytes: number): Promise<{ status: number; body: Uint8Array; finalUrl: string }> {
     const page = await this.getClearedOriginPage(new URL(url).origin);
-    const { status, base64 } = await page.evaluate(async (target) => {
+    const result = await page.evaluate(async ({ target, limit }) => {
       const response = await fetch(target);
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      let binary = "";
-      const chunkSize = 0x8000;
-      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+      const reader = response.body?.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > limit) {
+          await reader.cancel();
+          return { status: response.status, finalUrl: response.url, base64: null };
+        }
+        chunks.push(value);
       }
-      return { status: response.status, base64: btoa(binary) };
-    }, url);
-    return { status, body: new Uint8Array(Buffer.from(base64, "base64")) };
+      let binary = "";
+      for (const chunk of chunks) {
+        for (let offset = 0; offset < chunk.length; offset += 0x8000) {
+          binary += String.fromCharCode(...chunk.subarray(offset, offset + 0x8000));
+        }
+      }
+      return { status: response.status, finalUrl: response.url, base64: btoa(binary) };
+    }, { target: url, limit: maxBytes });
+    if (result.base64 === null) throw new Error(`Response from ${url} exceeds ${maxBytes} bytes`);
+    return { status: result.status, finalUrl: result.finalUrl, body: new Uint8Array(Buffer.from(result.base64, "base64")) };
   }
 
   async close(): Promise<void> {

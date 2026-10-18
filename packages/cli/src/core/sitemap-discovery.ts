@@ -10,8 +10,18 @@ import type { ArticleRef } from "@pluckmd/shared";
  * complete, date-sortable URL set in a few requests and needs no rendering.
  */
 
-/** Fetches raw bytes for a URL; injected so discovery is testable offline. */
-export type SitemapFetcher = (url: string) => Promise<{ status: number; body: Uint8Array }>;
+/**
+ * Fetches raw bytes for a URL; injected so discovery is testable offline.
+ * Implementations must stop reading past `maxBytes` (after transport
+ * decoding) and report the post-redirect URL as `finalUrl` when known.
+ */
+export type SitemapFetcher = (url: string, maxBytes: number) => Promise<SitemapFetchResult>;
+
+export interface SitemapFetchResult {
+  readonly status: number;
+  readonly body: Uint8Array;
+  readonly finalUrl?: string;
+}
 
 export interface SitemapEntry {
   readonly url: string;
@@ -41,16 +51,23 @@ const WELL_KNOWN_SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml"];
 const DEFAULT_MAX_SITEMAPS = 50;
 const GZIP_MAGIC = [0x1f, 0x8b];
 // sitemaps.org caps a sitemap at 50 MB uncompressed; also bounds gzip bombs.
-const MAX_SITEMAP_BYTES = 50 * 1024 * 1024;
+export const MAX_SITEMAP_BYTES = 50 * 1024 * 1024;
+// Budget across every sitemap in one discovery (Bain's 12 sitemaps total ~40 MB).
+const MAX_TOTAL_SITEMAP_BYTES = 250 * 1024 * 1024;
 
 export async function discoverArticlesFromSitemap(
   scopeUrl: string,
   fetcher: SitemapFetcher,
   options: SitemapDiscoveryOptions,
 ): Promise<SitemapDiscoveryResult> {
+  // robots.txt and sitemap indexes are site-controlled, so only follow (and
+  // only accept redirects to) sitemaps on the scope site or an explicitly
+  // passed sitemap's host, keeping a hostile site from steering requests.
+  const allowedHosts = new Set([siteKey(new URL(scopeUrl).hostname)]);
+  if (options.sitemapUrl) allowedHosts.add(siteKey(new URL(options.sitemapUrl).hostname));
   const rootSitemaps = options.sitemapUrl
     ? [options.sitemapUrl]
-    : await findSitemapUrls(new URL(scopeUrl).origin, fetcher);
+    : await findSitemapUrls(new URL(scopeUrl).origin, fetcher, allowedHosts);
   if (rootSitemaps.length === 0) {
     throw new Error(
       `No sitemap found for ${new URL(scopeUrl).origin} (checked robots.txt and ${WELL_KNOWN_SITEMAP_PATHS.join(", ")}). ` +
@@ -58,11 +75,6 @@ export async function discoverArticlesFromSitemap(
     );
   }
 
-  // robots.txt and sitemap indexes are site-controlled, so only follow
-  // sitemaps on the scope site (or an explicitly passed sitemap's host) to
-  // keep a hostile site from steering requests at other hosts.
-  const allowedHosts = new Set([siteKey(new URL(scopeUrl).hostname)]);
-  if (options.sitemapUrl) allowedHosts.add(siteKey(new URL(options.sitemapUrl).hostname));
   const { entries, fetchedSitemaps } = await collectSitemapEntries(
     rootSitemaps.filter((url) => isFollowableSitemap(url, allowedHosts)),
     fetcher,
@@ -83,8 +95,12 @@ export async function discoverArticlesFromSitemap(
 }
 
 /** Reads `Sitemap:` lines from robots.txt, falling back to well-known paths. */
-export async function findSitemapUrls(origin: string, fetcher: SitemapFetcher): Promise<string[]> {
-  const robots = await fetchText(`${origin}/robots.txt`, fetcher);
+export async function findSitemapUrls(
+  origin: string,
+  fetcher: SitemapFetcher,
+  allowedHosts: ReadonlySet<string> = new Set([siteKey(new URL(origin).hostname)]),
+): Promise<string[]> {
+  const robots = await fetchText(`${origin}/robots.txt`, fetcher, allowedHosts, MAX_SITEMAP_BYTES);
   const declared = robots
     ? [...robots.matchAll(/^\s*sitemap:\s*(\S+)/gim)].map((match) => match[1])
     : [];
@@ -92,7 +108,7 @@ export async function findSitemapUrls(origin: string, fetcher: SitemapFetcher): 
 
   for (const path of WELL_KNOWN_SITEMAP_PATHS) {
     const candidate = `${origin}${path}`;
-    const body = await fetchText(candidate, fetcher);
+    const body = await fetchText(candidate, fetcher, allowedHosts, MAX_SITEMAP_BYTES);
     if (body && /<(urlset|sitemapindex)\b/i.test(body)) return [candidate];
   }
   return [];
@@ -111,14 +127,16 @@ async function collectSitemapEntries(
   const queue = [...rootSitemaps];
   const visited = new Set<string>();
   const entries: SitemapEntry[] = [];
+  let remainingBytes = MAX_TOTAL_SITEMAP_BYTES;
 
-  while (queue.length > 0 && visited.size < maxSitemaps) {
+  while (queue.length > 0 && visited.size < maxSitemaps && remainingBytes > 0) {
     const sitemapUrl = queue.shift()!;
     if (visited.has(sitemapUrl)) continue;
     visited.add(sitemapUrl);
 
-    const xml = await fetchText(sitemapUrl, fetcher);
+    const xml = await fetchText(sitemapUrl, fetcher, allowedHosts, Math.min(MAX_SITEMAP_BYTES, remainingBytes));
     if (!xml) continue;
+    remainingBytes -= xml.length;
     const parsed = parseSitemapXml(xml);
     queue.push(...parsed.childSitemaps.filter((url) => isFollowableSitemap(url, allowedHosts)));
     entries.push(...parsed.entries);
@@ -287,12 +305,23 @@ function decodeXmlText(text: string): string {
     .replace(/&apos;/g, "'");
 }
 
-async function fetchText(url: string, fetcher: SitemapFetcher): Promise<string | null> {
+/**
+ * Returns null for unusable responses (non-2xx, off-site redirect, oversize,
+ * corrupt gzip) so one bad shard is skipped rather than aborting discovery.
+ */
+async function fetchText(
+  url: string,
+  fetcher: SitemapFetcher,
+  allowedHosts: ReadonlySet<string>,
+  maxBytes: number,
+): Promise<string | null> {
   try {
-    const { status, body } = await fetcher(url);
+    const { status, body, finalUrl } = await fetcher(url, maxBytes);
     if (status < 200 || status >= 300) return null;
-    const bytes = GZIP_MAGIC.every((byte, index) => body[index] === byte) ? gunzipSync(body, { maxOutputLength: MAX_SITEMAP_BYTES }) : body;
-    if (bytes.length > MAX_SITEMAP_BYTES) return null;
+    if (finalUrl && !isFollowableSitemap(finalUrl, allowedHosts)) return null;
+    const isGzip = GZIP_MAGIC.every((byte, index) => body[index] === byte);
+    const bytes = isGzip ? gunzipSync(body, { maxOutputLength: maxBytes }) : body;
+    if (bytes.length > maxBytes) return null;
     return new TextDecoder().decode(bytes);
   } catch {
     return null;

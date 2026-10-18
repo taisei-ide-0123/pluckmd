@@ -48,8 +48,14 @@ interface BrowserPage {
 /** The subset of RealBrowserFetcher the acquirer uses; injectable for tests. */
 export interface BotChallengeBrowser {
   fetchPage(url: string): Promise<RealBrowserPage>;
-  fetchBytes(url: string): Promise<{ status: number; body: Uint8Array }>;
+  fetchBytes(url: string, maxBytes: number): Promise<RawFetchResult>;
   close(): Promise<void>;
+}
+
+export interface RawFetchResult {
+  readonly status: number;
+  readonly body: Uint8Array;
+  readonly finalUrl: string;
 }
 
 export interface RenderingPageAcquirerOptions {
@@ -131,15 +137,15 @@ export class RenderingPageAcquirer implements PageAcquirer {
    * Raw-bytes fetch for sitemaps and robots.txt, escalating to real Chrome
    * when the static response is a bot challenge.
    */
-  async fetchBytes(url: string): Promise<{ status: number; body: Uint8Array }> {
+  async fetchBytes(url: string, maxBytes: number): Promise<RawFetchResult> {
     const host = new URL(url).host;
     if (!this.challengedHosts.has(host)) {
-      const response = await fetchStaticBytes(url, this.timeoutMs);
+      const response = await fetchStaticBytes(url, this.timeoutMs, maxBytes);
       const html = new TextDecoder().decode(response.body.subarray(0, 64 * 1024));
       if (!detectBotChallenge({ status: response.status, html })) return response;
       this.challengedHosts.add(host);
     }
-    return this.realBrowser.fetchBytes(url);
+    return this.realBrowser.fetchBytes(url, maxBytes);
   }
 
   async close(): Promise<void> {
@@ -368,17 +374,34 @@ class PlaywrightDomEvaluator implements DomEvaluator {
   }
 }
 
-async function fetchStaticBytes(
-  url: string,
-  timeoutMs: number,
-): Promise<{ status: number; body: Uint8Array }> {
-  const response = await undiciFetch(url, {
-    dispatcher: staticFetchAgent,
-    redirect: "follow",
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: { "User-Agent": DEFAULT_USER_AGENT, Accept: "application/xml,text/xml,text/plain,*/*" },
-  });
-  return { status: response.status, body: new Uint8Array(await response.arrayBuffer()) };
+/**
+ * Reads at most `maxBytes` of the decoded body; larger responses are aborted
+ * mid-stream so Content-Encoding cannot inflate them past the cap in memory.
+ */
+async function fetchStaticBytes(url: string, timeoutMs: number, maxBytes: number): Promise<RawFetchResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await undiciFetch(url, {
+      dispatcher: staticFetchAgent,
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "User-Agent": DEFAULT_USER_AGENT, Accept: "application/xml,text/xml,text/plain,*/*" },
+    });
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for await (const chunk of response.body ?? []) {
+      received += chunk.byteLength;
+      if (received > maxBytes) {
+        controller.abort();
+        throw new Error(`Response from ${url} exceeds ${maxBytes} bytes`);
+      }
+      chunks.push(chunk);
+    }
+    return { status: response.status, body: Buffer.concat(chunks), finalUrl: response.url || url };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function isUsableStaticPage(page: StaticFetchResult): boolean {

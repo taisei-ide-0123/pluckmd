@@ -12,6 +12,11 @@ const staticHits: string[] = [];
 beforeAll(async () => {
   server = createServer((request, response) => {
     staticHits.push(request.url ?? "");
+    if (request.url === "/huge.xml") {
+      response.writeHead(200, { "Content-Type": "application/xml" });
+      response.end("x".repeat(64 * 1024));
+      return;
+    }
     if (request.url?.startsWith("/blocked")) {
       response.writeHead(403, { "Content-Type": "text/html" });
       response.end(CHALLENGE_HTML);
@@ -38,7 +43,7 @@ function fakeBrowser(): BotChallengeBrowser & { pages: string[]; files: string[]
     },
     fetchBytes: async (url) => {
       files.push(url);
-      return { status: 200, body: new TextEncoder().encode("<urlset></urlset>") };
+      return { status: 200, body: new TextEncoder().encode("<urlset></urlset>"), finalUrl: url };
     },
     close: async () => undefined,
   };
@@ -61,7 +66,7 @@ describe("RenderingPageAcquirer bot-challenge escalation", () => {
 
     const first = await acquirer.acquire(`${origin}/blocked/a`);
     const second = await acquirer.acquire(`${origin}/blocked/b`);
-    const sitemap = await acquirer.fetchBytes(`${origin}/sitemap.xml`);
+    const sitemap = await acquirer.fetchBytes(`${origin}/sitemap.xml`, 1024);
 
     expect(first).toMatchObject({ source: "rendered", status: 200, html: "<p>through chrome</p>" });
     expect(second.source).toBe("rendered");
@@ -69,5 +74,15 @@ describe("RenderingPageAcquirer bot-challenge escalation", () => {
     expect(staticHits).toEqual(["/blocked/a"]);
     expect(browser.pages).toEqual([`${origin}/blocked/a`, `${origin}/blocked/b`]);
     expect(browser.files).toEqual([`${origin}/sitemap.xml`]);
+  });
+});
+
+describe("RenderingPageAcquirer.fetchBytes", () => {
+  it("returns the final URL and aborts bodies over the byte cap", async () => {
+    const acquirer = new RenderingPageAcquirer({ render: "never", realBrowser: fakeBrowser() });
+
+    const small = await acquirer.fetchBytes(`${origin}/open`, 1024 * 1024);
+    expect(small.finalUrl).toBe(`${origin}/open`);
+    await expect(acquirer.fetchBytes(`${origin}/huge.xml`, 1024)).rejects.toThrow(/exceeds 1024 bytes/);
   });
 });

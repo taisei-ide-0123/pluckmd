@@ -120,6 +120,22 @@ describe("discoverArticlesFromSitemap", () => {
     expect(requested.some((url) => url.includes("127.0.0.1") || url.includes("169.254"))).toBe(false);
   });
 
+  it("ignores sitemaps that redirect to another host", async () => {
+    const fetcher: SitemapFetcher = async (url) => {
+      if (url === "https://example.com/robots.txt") {
+        return { status: 200, body: new TextEncoder().encode("Sitemap: https://example.com/s.xml") };
+      }
+      return {
+        status: 200,
+        body: new TextEncoder().encode(urlset([["https://example.com/blog/a"]])),
+        finalUrl: "http://169.254.169.254/latest",
+      };
+    };
+
+    const result = await discoverArticlesFromSitemap("https://example.com/blog", fetcher, { limit: 10 });
+    expect(result.totalEntries).toBe(0);
+  });
+
   it("rejects gzip payloads that expand beyond the sitemap size cap", async () => {
     const bomb = gzipSync(Buffer.alloc(51 * 1024 * 1024, 0x20));
     const fetcher = fakeFetcher({ "https://example.com/s.xml.gz": bomb });
